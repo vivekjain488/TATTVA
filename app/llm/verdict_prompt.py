@@ -1,0 +1,263 @@
+"""
+LLM-generated plain-English verdict using Groq or Google Gemini.
+Falls back gracefully when no API key is set.
+"""
+import asyncio
+import logging
+import os
+from typing import Literal
+
+logger = logging.getLogger(__name__)
+
+# Each provider attempt (Groq, then Gemini, or vice versa per LLM_PROVIDER)
+# is bounded by this many seconds. Without it, a slow/hanging LLM API has no
+# ceiling — the SDK's own defaults (Groq: ~60s read timeout x up to 3 tries;
+# Gemini: effectively unbounded) — and because the network call is
+# synchronous, an unbounded wait here blocks the whole FastAPI event loop,
+# not just this one request (see asyncio.to_thread usage below).
+VERDICT_TIMEOUT_S = float(os.getenv("VERDICT_TIMEOUT_S", "20"))
+
+
+def _build_prompt(payload: dict) -> str:
+    scores = payload.get("modality_scores", {})
+    fusion_risk = payload.get("fusion_risk", 0.5)
+    contra = payload.get("contradiction", {})
+    density = payload.get("density_details", {})
+    karat = payload.get("declared_karat", "unknown")
+    desc = payload.get("item_description", "gold item")
+    risk_level = payload.get("risk_level", "UNKNOWN")
+    loan_action = payload.get("loan_action", "HOLD")
+    density_risk = payload.get("density_risk", 0.0)
+
+    flags_text = "; ".join(contra.get("flags", [])) or "none"
+    contra_score = contra.get("contradiction_score", 0.0)
+
+    density_note = ""
+    if density_risk >= 0.85:
+        measured  = density.get("measured_density", "N/A")
+        exp_low   = density.get("expected_low", "N/A")
+        exp_high  = density.get("expected_high", "N/A")
+        direction = density.get("karat_verdict", "")
+        closest   = density.get("closest_fake")
+        dir_text = {
+            "LOW_DENSITY":  "BELOW the gold range (too light for gold)",
+            "HIGH_DENSITY": "ABOVE the gold range (denser than the declared alloy)",
+        }.get(direction, "outside the gold range")
+        best = density.get("best_match") or {}
+        if best.get("kind") == "karat":
+            closest_text = (f" IMPORTANT: the reading IS consistent with genuine {best['name']} "
+                            f"({best.get('probability', 0)*100:.0f}% match) — this is likely a purity "
+                            "mis-declaration, not fake metal; recommend revaluation at the matched karat.")
+        else:
+            closest_text = f" The closest known metal to this reading is {closest}." if closest else ""
+        density_note = (
+            f"\n⚠️  DENSITY OVERRIDE ACTIVE: Measured density ({measured} ± {density.get('sigma', 'N/A')} g/cm³) "
+            f"is critically outside the expected range for {karat}K gold ({exp_low}–{exp_high} g/cm³). "
+            f"The reading is {dir_text}.{closest_text} "
+            "This alone triggered the REJECT decision regardless of other signals. "
+            "When explaining, state the direction correctly — do NOT describe a low reading as a dense core, "
+            "and do NOT describe a high reading as plated base metal."
+        )
+
+    return f"""You are a senior gold appraiser at a bank helping a junior officer understand an AI analysis result.
+
+Item: {desc} (declared {karat}K gold)
+FINAL SYSTEM DECISION: {risk_level} - {loan_action}{density_note}
+
+Analysis results:
+- Overall fusion risk score: {fusion_risk:.2f} (0=genuine, 1=fake)
+- Image analysis risk: {scores.get('image', {}).get('risk_score', 'N/A')}
+- Density analysis risk: {scores.get('density', {}).get('risk_score', 'N/A')} (measured density: {density.get('measured_density', 'N/A')} g/cm³, expected {density.get('expected_low', 'N/A')}-{density.get('expected_high', 'N/A')} g/cm³)
+- Acoustic analysis risk: {scores.get('acoustic', {}).get('risk_score', 'N/A')}
+- Streak analysis risk: {scores.get('streak', {}).get('risk_score', 'N/A')}
+- Cross-modal contradiction score: {contra_score:.2f}
+- Contradiction flags: {flags_text}
+
+Your explanation MUST be consistent with the FINAL SYSTEM DECISION above.
+Write TWO short paragraphs for a bank officer with no ML background:
+1. What these results mean in plain English (2-3 sentences). If REJECT, clearly state why. If density triggered the rejection, explain the density anomaly.
+2. What action the officer should take next (1-2 sentences), consistent with the {loan_action} decision.
+
+Be direct and specific. Do not use jargon. Do not repeat the numbers verbatim."""
+
+
+def _heuristic_verdict(
+    fusion_risk: float,
+    contradiction_flags: list,
+    risk_level: str = "GENUINE",
+    density_risk: float = 0.0,
+    density_details: dict = None,
+    declared_karat: int = 22,
+) -> tuple[str, str]:
+    """Fallback plain-English verdict when no LLM is available."""
+    has_flags = len(contradiction_flags) > 0
+    density_details = density_details or {}
+
+    # Density-triggered rejection: explain the physical anomaly specifically
+    if density_risk >= 0.85 or risk_level == "REJECT":
+        measured = density_details.get("measured_density")
+        exp_low  = density_details.get("expected_low")
+        exp_high = density_details.get("expected_high")
+
+        if density_risk >= 0.85 and measured is not None:
+            direction = density_details.get("karat_verdict")
+            closest   = density_details.get("closest_fake")
+            best      = density_details.get("best_match") or {}
+
+            if best.get("kind") == "karat":
+                # Genuine gold, wrong claim: purity mis-declaration, not fake metal
+                explanation = (
+                    f"The weight-in-water test measured {measured:.2f} g/cm³, which does not match the "
+                    f"declared {declared_karat}K range ({exp_low}–{exp_high} g/cm³) but IS consistent with "
+                    f"genuine {best['name']} ({best['probability']*100:.0f}% match). This looks like a purity "
+                    "mis-declaration rather than fake metal."
+                )
+                action = (
+                    f"Do not approve at the declared {declared_karat}K. If the customer accepts revaluation, "
+                    f"re-run the analysis with the karat declared as {best.get('karat')}K and value accordingly."
+                )
+                return explanation, action
+
+            if direction == "LOW_DENSITY":
+                cause = "far BELOW the gold range" + (
+                    f" — consistent with a base metal such as {closest} under a gold-coloured surface"
+                    if closest else ""
+                )
+            elif direction == "HIGH_DENSITY":
+                cause = "ABOVE the gold range — consistent with a dense non-gold filler"
+            else:
+                cause = "outside the achievable range for any gold alloy"
+            explanation = (
+                f"The Archimedes density test measured {measured:.2f} g/cm³ against the declared "
+                f"{declared_karat}K expected range of {exp_low}–{exp_high} g/cm³. "
+                f"The reading is {cause}. No legitimate gold alloy can produce this density."
+            )
+        elif has_flags:
+            flag_summary = contradiction_flags[0]
+            explanation = (
+                f"Multiple analysis signals indicate this item is likely not genuine gold at the declared karat. "
+                f"Key concern: {flag_summary}. The cross-modal conflict pattern is consistent with a "
+                "composite item (e.g., tungsten core with thin gold plating)."
+            )
+        else:
+            explanation = (
+                "Multiple analysis signals indicate this item is likely not genuine gold at the declared karat. "
+                "The combined risk score across density, acoustic, visual, and streak tests is critically high."
+            )
+        action = "Do not approve the loan. Escalate to the branch gold appraiser for physical XRF or acid testing."
+        return explanation, action
+
+    if fusion_risk < 0.25:
+        explanation = (
+            "All analysis signals - visual appearance, density, sound, and streak test - "
+            "are consistent with genuine gold at the declared karat. No suspicious patterns were detected."
+        )
+        action = "The item appears genuine. You may proceed with loan approval subject to standard documentation checks."
+    elif fusion_risk < 0.55:
+        if has_flags:
+            flag_summary = contradiction_flags[0] if contradiction_flags else ""
+            explanation = (
+                f"The analysis detected a conflict between signals: {flag_summary}. "
+                "This pattern can indicate a composite item (e.g., tungsten core with gold plating) "
+                "that passes some tests but fails others."
+            )
+            action = "Hold the item for secondary physical testing. Consider XRF spectrometry or acid test before approving."
+        else:
+            explanation = (
+                "Most signals are in the genuine range but one or more are borderline. "
+                "The item cannot be confidently classified without additional verification."
+            )
+            action = "Recommend a secondary physical verification (acid test or XRF) before proceeding."
+    else:
+        explanation = (
+            "Multiple analysis signals indicate this item is likely not genuine gold at the declared karat. "
+            + (f"Key concern: {contradiction_flags[0]}" if contradiction_flags else "High overall risk score.")
+        )
+        action = "Do not approve the loan for this item. Escalate to the branch gold appraiser for manual inspection."
+
+    return explanation, action
+
+
+def _parse_two_paragraphs(text: str) -> tuple[str, str]:
+    paragraphs = [p.strip() for p in text.strip().split("\n\n") if p.strip()]
+    explanation = paragraphs[0] if paragraphs else text.strip()
+    action = paragraphs[1] if len(paragraphs) > 1 else ""
+    return explanation, action
+
+
+def _call_groq_sync(prompt: str, api_key: str) -> dict:
+    """Blocking Groq call — run via asyncio.to_thread, never awaited directly."""
+    from groq import Groq
+    client = Groq(api_key=api_key, timeout=VERDICT_TIMEOUT_S)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=300,
+    )
+    explanation, action = _parse_two_paragraphs(response.choices[0].message.content)
+    return {"plain_english": explanation, "action": action, "llm_provider": "groq:llama-3.3-70b-versatile"}
+
+
+def _call_gemini_sync(prompt: str, api_key: str) -> dict:
+    """Blocking Gemini call — run via asyncio.to_thread, never awaited directly."""
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(prompt, request_options={"timeout": VERDICT_TIMEOUT_S})
+    explanation, action = _parse_two_paragraphs(response.text)
+    return {"plain_english": explanation, "action": action, "llm_provider": "gemini-1.5-flash"}
+
+
+async def generate_verdict(payload: dict) -> dict:
+    """
+    Generate LLM verdict. Tries the configured primary provider, then the
+    other as a fallback, then a heuristic. Each provider attempt is bounded
+    by VERDICT_TIMEOUT_S and run off the event loop via asyncio.to_thread —
+    both SDK calls are synchronous network I/O, so awaiting them directly
+    (the previous behaviour) blocked every other concurrent request on this
+    server for however long a slow/hanging LLM API took to respond.
+    """
+    provider = os.getenv("LLM_PROVIDER", "groq").lower()
+    fusion_risk  = payload.get("fusion_risk", 0.5)
+    density_risk = payload.get("density_risk", 0.0)
+    risk_level   = payload.get("risk_level", "GENUINE")
+    loan_action  = payload.get("loan_action", "APPROVE")
+    contra = payload.get("contradiction", {})
+    flags  = contra.get("flags", [])
+
+    prompt = _build_prompt(payload)
+
+    groq_key   = os.getenv("GROQ_API_KEY")
+    google_key = os.getenv("GOOGLE_API_KEY")
+    groq_attempt   = ("groq",   groq_key,   _call_groq_sync)
+    gemini_attempt = ("gemini", google_key, _call_gemini_sync)
+    # Try the configured primary first, then the other as a fallback — a
+    # failure/timeout on the primary no longer skips the fallback (it used
+    # to, whenever GROQ_API_KEY was set and provider=="groq": the Gemini
+    # branch's own condition guarded against that exact case).
+    attempts = [gemini_attempt, groq_attempt] if provider in ("gemini", "google") else [groq_attempt, gemini_attempt]
+
+    for name, api_key, fn in attempts:
+        if not api_key:
+            continue
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(fn, prompt, api_key), timeout=VERDICT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning("%s LLM verdict timed out after %ss — falling back", name, VERDICT_TIMEOUT_S)
+        except Exception as e:
+            logger.warning("%s LLM verdict failed (%s) — falling back", name, e)
+
+    explanation, action = _heuristic_verdict(
+        fusion_risk,
+        flags,
+        risk_level=risk_level,
+        density_risk=density_risk,
+        density_details=payload.get("density_details", {}),
+        declared_karat=payload.get("declared_karat", 22),
+    )
+    return {
+        "plain_english":  explanation,
+        "action":         action,
+        "llm_provider":   "heuristic",
+    }
