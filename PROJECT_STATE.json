@@ -1,0 +1,36 @@
+{
+  "project": "TATTVA-AI",
+  "version": "2.0.0-physics-first",
+  "last_updated": "2026-07-16",
+  "summary": "Physics-first spurious-gold detection. Three mandatory core tests (weight-in-water with propagated uncertainty, DSIP photo material scan, ring-pitch acoustic physics), transparent log-odds fusion, declared decision policy, 10-step officer verification trail. No uploaded media persisted.",
+  "decision_stack": {
+    "density": "Archimedes + CRC water table + JCGM 106 conformity; claim-blind best-match identification (karat optional)",
+    "photo": "Deterministic classical CV: backdrop removal, stone detection (coloured + colourless), inclusion cross-check, composition mixture model; baselines calibrated from 104 genuine photos",
+    "sound": "Ring-pitch vs band calibrated from genuine recordings (v=sqrt(E/rho)); 10/10 composites flagged on real data; SVM secondary",
+    "fusion": "Log-odds evidence sum with reliability weights and blind-spot floors; hand-recomputable; XGBoost kept as opt-in baseline (FUSION_MODE=xgboost)",
+    "policy": "data/decision_policy.json — bands, overrides, multi-test approval mandate (weight+photo+sound)",
+    "records": "Benford first-digit monitor on branch logs; shown to officer only when alerting"
+  },
+  "calibration_files": [
+    "data/acoustic_calibration.json (scripts/calibrate_acoustic.py)",
+    "data/dsip_calibration.json (scripts/calibrate_dsip.py)",
+    "data/decision_policy.json"
+  ],
+  "known_issues": [
+    "Streak model abstains (proxy-trained) pending DS-7 real touchstone photos",
+    "CNN image probe off the decision path by default (USE_CNN_PROBE=1 to re-enable)",
+    "Acoustic band calibrated per item class — recalibrate on own genuine items before demo",
+    "Colourless-stone detection is shape/texture-based and imperfect; photo stone fraction is a lower bound",
+    "Decision thresholds are declared policy dials pending pilot data",
+    "Groq API key invalid in .env — verdict text falls back to Gemini/heuristic (both direction-aware)"
+  ],
+  "pilot_backlog": [
+    "SQLite migration for case_history/density_log (concurrent-officer safety)",
+    "Coverage gate: multi-angle photo requirement before ACCEPT",
+    "Reference-panel calibration with real gold pieces (z-threshold empirics)",
+    "In-browser mic/camera capture"
+  ],
+  "demo_ready": true,
+  "presentation": "SuRaksha Cyber Hackathon 2.0 — IISc Bangalore, July 2026",
+  "quick_start": "backend: python3 -m uvicorn app.main:app --reload --port 8000 | frontend: cd frontend && npm run dev | open http://localhost:5173"
+}
